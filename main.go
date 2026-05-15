@@ -417,7 +417,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Manual save
 				return m, doSaveTasks(m.tasks, m.log)
 			case "q":
-				return m, tea.Sequence(doSaveTasks(m.tasks, m.log), tea.Quit)
+				return m, tea.Sequence(tea.Quit)
 			}
 		}
 
