@@ -8,7 +8,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/joho/godotenv"
 )
 
 type NotionPage struct {
