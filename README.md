@@ -35,8 +35,8 @@ notion-brief/
 ├── main.go       # TUI — all screens, views, keybindings, state
 ├── ai.go         # AI provider layer — Ollama, Claude, OpenAI
 ├── notion.go     # Notion API — page listing and recursive block fetching
-├── config.go     # Config persistence (~/.config/notion-brief/config.json)
-├── tasks.go      # Task persistence (~/.local/share/notion-brief/tasks.json)
+├── config.go     # Config persistence (~/data/config.json)
+├── tasks.go      # Task persistence (~/data/tasks.json)
 └── go.mod
 ```
 
