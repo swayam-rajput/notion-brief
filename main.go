@@ -20,9 +20,9 @@ import (
 // -----------------------------------------------------------------------
 
 var (
-	accent = lipgloss.Color("#F5A623")
+	accent = lipgloss.Color("#819C91")
 	muted  = lipgloss.Color("#555555")
-	done   = lipgloss.Color("#5A9E6F")
+	done   = lipgloss.Color("#9BBFA6")
 	dim    = lipgloss.Color("#D0D0D0")
 
 	styleTabActive = lipgloss.NewStyle().
@@ -42,7 +42,7 @@ var (
 			BorderForeground(muted).
 			MarginBottom(1)
 
-	styleHint     = lipgloss.NewStyle().Foreground(muted).Italic(true)
+	styleHint     = lipgloss.NewStyle().Foreground(muted).Italic(false)
 	styleCursor   = lipgloss.NewStyle().Foreground(accent).Bold(true)
 	styleDone     = lipgloss.NewStyle().Foreground(done).Strikethrough(true)
 	stylePending  = lipgloss.NewStyle().Foreground(dim)
@@ -53,7 +53,7 @@ var (
 	styleSelected = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#000000")).
 			Background(accent).
-			Bold(true)
+			Bold(false).PaddingRight(1)
 )
 
 // -----------------------------------------------------------------------
@@ -342,6 +342,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rebuildTaskViewport()
 				m.rebuildDoneViewport()
 				return m, nil
+			case "q":
+				return m, tea.Quit
 			}
 		}
 
@@ -488,16 +490,16 @@ func (m model) tabBar() string {
 func (m model) hintLine() string {
 	switch m.activeView {
 	case viewBriefing:
-		return styleHint.Render("j/k scroll  •  c copy  •  1-4/tab switch")
+		return styleHint.Render("j/k scroll  •  c copy  •  1-4/tab switch  •  [q] quit")
 	case viewPages:
-		return styleHint.Render("j/k navigate  •  enter summarize  •  r refresh  •  1-4/tab switch")
+		return styleHint.Render("j/k navigate  •  enter summarize  •  r refresh  •  1-4/tab switch  •  [q] quit")
 	case viewTasks:
 		if m.inputActive {
 			return styleHint.Render("enter confirm  •  esc cancel")
 		}
-		return styleHint.Render("j/k navigate  •  space toggle  •  n add  •  d delete  •  1-4/tab switch")
+		return styleHint.Render("j/k navigate  •  space toggle  •  n add  •  d delete  •  1-4/tab switch  •  [q] quit")
 	case viewDone:
-		return styleHint.Render("j/k scroll  •  1-4/tab switch")
+		return styleHint.Render("j/k scroll  •  1-4/tab switch  •  [q] quit")
 	}
 	return ""
 }
@@ -526,7 +528,7 @@ func (m model) activeContent() string {
 	case viewTasks:
 		content := m.taskViewport.View()
 		if m.inputActive {
-			content += "\n\n" + styleCursor.Render("> ") + m.input.View()
+			content += "\n\n"  + m.input.View()
 		}
 		return content
 
