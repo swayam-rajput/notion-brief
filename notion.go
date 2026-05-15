@@ -275,21 +275,3 @@ func notionRequest(method, url string, body io.Reader) ([]byte, error) {
 
 	return respBody, nil
 }
-
-func pr() {
-	err := godotenv.Load()
-	if err != nil {
-		fmt.Println("No .env file found")
-	}
-
-	pages, err := fetchNotionPages()
-	if err != nil {
-		fmt.Println("ERROR:", err)
-		return
-	}
-
-	fmt.Println("\nNOTION PAGES:")
-	for _, p := range pages {
-		fmt.Printf("- %s\n", p.Title)
-	}
-}
