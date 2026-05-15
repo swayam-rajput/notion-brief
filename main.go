@@ -15,62 +15,65 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// -----------------------------------------------------------------------
+// Styles
+// -----------------------------------------------------------------------
+
 var (
 	accent = lipgloss.Color("#F5A623")
 	muted  = lipgloss.Color("#555555")
 	done   = lipgloss.Color("#5A9E6F")
 	dim    = lipgloss.Color("#D0D0D0")
-	border = lipgloss.Color("#2A2A2A")
 
-	styleHeader = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(accent)
-
-	styleBox = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(border).
-			Padding(1, 2).
-			MarginBottom(1)
-
-	styleLabel = lipgloss.NewStyle().
+	styleTabActive = lipgloss.NewStyle().
 			Foreground(accent).
 			Bold(true).
+			PaddingLeft(1).
+			PaddingRight(1)
+
+	styleTabInactive = lipgloss.NewStyle().
+				Foreground(muted).
+				PaddingLeft(1).
+				PaddingRight(1)
+
+	styleTabBar = lipgloss.NewStyle().
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderBottom(true).
+			BorderForeground(muted).
 			MarginBottom(1)
 
-	styleBrief = lipgloss.NewStyle().
-			Foreground(dim).
-			Italic(true)
-
-	styleHint = lipgloss.NewStyle().
-			Foreground(muted).
-			Italic(true)
-
-	styleCursor = lipgloss.NewStyle().
-			Foreground(accent).
-			Bold(true)
-
-	styleDone = lipgloss.NewStyle().
-			Foreground(done).
-			Strikethrough(true)
-
-	stylePending = lipgloss.NewStyle().
-			Foreground(dim)
-
-	styleLogTime = lipgloss.NewStyle().
-			Foreground(accent)
-
-	styleLogText = lipgloss.NewStyle().
-			Foreground(muted)
-
-	styleErr = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#AA4444")).
-			Italic(true)
-
+	styleHint     = lipgloss.NewStyle().Foreground(muted).Italic(true)
+	styleCursor   = lipgloss.NewStyle().Foreground(accent).Bold(true)
+	styleDone     = lipgloss.NewStyle().Foreground(done).Strikethrough(true)
+	stylePending  = lipgloss.NewStyle().Foreground(dim)
+	styleBrief    = lipgloss.NewStyle().Foreground(dim).Italic(true)
+	styleErr      = lipgloss.NewStyle().Foreground(lipgloss.Color("#AA4444")).Italic(true)
+	styleLogTime  = lipgloss.NewStyle().Foreground(accent)
+	styleLogText  = lipgloss.NewStyle().Foreground(muted)
 	styleSelected = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#000000")).
 			Background(accent).
 			Bold(true)
 )
+
+// -----------------------------------------------------------------------
+// Views
+// -----------------------------------------------------------------------
+
+type view int
+
+const (
+	viewBriefing view = iota
+	viewPages
+	viewTasks
+	viewDone
+)
+
+var viewNames = []string{"Briefing", "Pages", "Tasks", "Done"}
+
+// -----------------------------------------------------------------------
+// Messages
+// -----------------------------------------------------------------------
 
 type fetchedPagesMsg struct {
 	pages []NotionPage
@@ -82,6 +85,10 @@ type summaryMsg struct {
 	err     error
 }
 
+// -----------------------------------------------------------------------
+// Data types
+// -----------------------------------------------------------------------
+
 type Task struct {
 	Text string
 	Done bool
@@ -92,18 +99,15 @@ type LogEntry struct {
 	At   time.Time
 }
 
-type focusArea int
-
-const (
-	focusBriefing focusArea = iota
-	focusPages
-	focusTasks
-	focusInput
-)
+// -----------------------------------------------------------------------
+// Model
+// -----------------------------------------------------------------------
 
 type model struct {
 	width  int
 	height int
+
+	activeView view
 
 	loading     bool
 	summarizing bool
@@ -115,12 +119,15 @@ type model struct {
 	briefViewport viewport.Model
 	pagesViewport viewport.Model
 	taskViewport  viewport.Model
+	doneViewport  viewport.Model
 
-	tasks      []Task
-	cursor     int
 	pageCursor int
-	focus      focusArea
-	input      textinput.Model
+
+	tasks  []Task
+	cursor int
+
+	inputActive bool
+	input       textinput.Model
 
 	log []LogEntry
 }
@@ -131,29 +138,25 @@ func newModel() model {
 	sp.Style = lipgloss.NewStyle().Foreground(accent)
 
 	ti := textinput.New()
-	ti.Placeholder = "Type a task and press Enter..."
+	ti.Placeholder = "New task..."
 	ti.CharLimit = 120
 	ti.Width = 50
-
-	briefVP := viewport.New(80, 7)
-	briefVP.SetContent("Select a page and press Enter to summarize.")
-
-	pagesVP := viewport.New(80, 10)
-	pagesVP.SetContent("Loading...")
-
-	taskVP := viewport.New(80, 10)
-	taskVP.SetContent("No tasks yet.")
 
 	return model{
 		loading:       true,
 		spinner:       sp,
 		input:         ti,
-		focus:         focusPages,
-		briefViewport: briefVP,
-		pagesViewport: pagesVP,
-		taskViewport:  taskVP,
+		activeView:    viewPages,
+		briefViewport: viewport.New(80, 10),
+		pagesViewport: viewport.New(80, 10),
+		taskViewport:  viewport.New(80, 10),
+		doneViewport:  viewport.New(80, 10),
 	}
 }
+
+// -----------------------------------------------------------------------
+// Init
+// -----------------------------------------------------------------------
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(m.spinner.Tick, doFetchPages)
@@ -165,68 +168,112 @@ func doFetchPages() tea.Msg {
 	return fetchedPagesMsg{pages: pages, err: err}
 }
 
-func doSummarize(page NotionPage) tea.Cmd {
+func doSummarize(page NotionPage, tasks []Task) tea.Cmd {
 	return func() tea.Msg {
 		content, err := fetchPageContent(page.ID)
 		if err != nil {
 			return summaryMsg{err: err}
 		}
 
-		summary, err := summarizeWithOllama(content)
+		// Give the model full task context so it knows what's done and what's pending
+		var pending, completed []string
+		for _, t := range tasks {
+			if t.Done {
+				completed = append(completed, "- "+t.Text)
+			} else {
+				pending = append(pending, "- "+t.Text)
+			}
+		}
+		taskContext := ""
+		if len(pending) > 0 {
+			taskContext += "\n\nPending tasks:\n" + strings.Join(pending, "\n")
+		}
+		if len(completed) > 0 {
+			taskContext += "\n\nCompleted today:\n" + strings.Join(completed, "\n")
+		}
+
+		summary, err := summarizeWithOllama(content + taskContext)
 		return summaryMsg{summary: summary, err: err}
 	}
 }
 
+// -----------------------------------------------------------------------
+// Viewport rebuilders
+// -----------------------------------------------------------------------
+
 func (m *model) rebuildPagesViewport() {
 	var lines []string
-
 	for i, p := range m.pages {
-		cursor := "  "
 		edited := ""
 		if len(p.LastEditedTime) >= 10 {
 			edited = p.LastEditedTime[:10]
 		}
-
 		row := fmt.Sprintf("%s  %s", edited, p.Title)
-
-		if i == m.pageCursor && m.focus == focusPages {
-			cursor = styleCursor.Render("> ")
-			lines = append(lines, cursor+styleSelected.Render(row))
+		if i == m.pageCursor {
+			lines = append(lines, styleCursor.Render("> ")+styleSelected.Render(row))
 		} else {
-			lines = append(lines, cursor+row)
+			lines = append(lines, "  "+styleHint.Render(row))
 		}
 	}
-
 	if len(lines) == 0 {
-		lines = append(lines, "No pages found.")
+		lines = []string{styleHint.Render("No pages found.")}
 	}
-
 	m.pagesViewport.SetContent(strings.Join(lines, "\n"))
 }
 
 func (m *model) rebuildTaskViewport() {
 	var lines []string
-
 	for i, t := range m.tasks {
 		cursor := "  "
-
-		if i == m.cursor && m.focus == focusTasks {
+		if i == m.cursor {
 			cursor = styleCursor.Render("> ")
 		}
-
 		if t.Done {
 			lines = append(lines, cursor+styleDone.Render("[x] "+t.Text))
 		} else {
 			lines = append(lines, cursor+stylePending.Render("[ ] "+t.Text))
 		}
 	}
-
 	if len(lines) == 0 {
-		lines = append(lines, "No tasks yet.")
+		lines = []string{styleHint.Render("No tasks yet. Press n to add one.")}
 	}
-
 	m.taskViewport.SetContent(strings.Join(lines, "\n"))
 }
+
+func (m *model) rebuildDoneViewport() {
+	var lines []string
+	for _, e := range m.log {
+		lines = append(lines,
+			styleLogTime.Render(e.At.Format("15:04"))+" "+styleLogText.Render(e.Text),
+		)
+	}
+	if len(lines) == 0 {
+		lines = []string{styleHint.Render("Nothing done yet.")}
+	}
+	m.doneViewport.SetContent(strings.Join(lines, "\n"))
+}
+
+func (m *model) resizeViewports() {
+	contentH := m.height - 6
+	if contentH < 4 {
+		contentH = 4
+	}
+	w := m.width - 4
+
+	m.briefViewport.Width = w
+	m.briefViewport.Height = contentH
+	m.pagesViewport.Width = w
+	m.pagesViewport.Height = contentH
+	m.taskViewport.Width = w
+	m.taskViewport.Height = contentH
+	m.doneViewport.Width = w
+	m.doneViewport.Height = contentH
+	m.input.Width = w - 4
+}
+
+// -----------------------------------------------------------------------
+// Update
+// -----------------------------------------------------------------------
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -234,17 +281,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.input.Width = m.width - 14
-
-		panelWidth := m.width - 10
-
-		m.briefViewport.Width = panelWidth
-		m.pagesViewport.Width = panelWidth
-		m.taskViewport.Width = panelWidth
-
+		m.resizeViewports()
 		m.rebuildPagesViewport()
 		m.rebuildTaskViewport()
-
+		m.rebuildDoneViewport()
 		return m, nil
 
 	case spinner.TickMsg:
@@ -266,11 +306,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case summaryMsg:
 		m.summarizing = false
 		if msg.err != nil {
-			m.fetchErr = msg.err.Error()
-			m.briefViewport.SetContent(styleErr.Render("error: " + m.fetchErr))
+			m.briefViewport.SetContent(styleErr.Render("error: " + msg.err.Error()))
 		} else {
 			m.summary = msg.summary
-			m.fetchErr = ""
 			m.briefViewport.SetContent(styleBrief.Render(m.summary))
 		}
 		return m, nil
@@ -280,40 +318,48 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
-		if msg.String() == "tab" {
-			switch m.focus {
-			case focusBriefing:
-				m.focus = focusPages
-			case focusPages:
-				m.focus = focusTasks
-			case focusTasks:
-				m.focus = focusInput
-				m.input.Focus()
-			case focusInput:
-				m.focus = focusBriefing
-				m.input.Blur()
+		// View switching — skip if user is typing a task
+		if !m.inputActive {
+			switch msg.String() {
+			case "1":
+				m.activeView = viewBriefing
+				return m, nil
+			case "2":
+				m.activeView = viewPages
+				m.rebuildPagesViewport()
+				return m, nil
+			case "3":
+				m.activeView = viewTasks
+				m.rebuildTaskViewport()
+				return m, nil
+			case "4":
+				m.activeView = viewDone
+				m.rebuildDoneViewport()
+				return m, nil
+			case "tab":
+				m.activeView = (m.activeView + 1) % 4
+				m.rebuildPagesViewport()
+				m.rebuildTaskViewport()
+				m.rebuildDoneViewport()
+				return m, nil
 			}
-
-			m.rebuildPagesViewport()
-			m.rebuildTaskViewport()
-			return m, nil
 		}
 
-		if m.focus == focusInput {
+		// Task input mode
+		if m.inputActive {
 			switch msg.String() {
 			case "enter":
 				text := strings.TrimSpace(m.input.Value())
 				if text != "" {
 					m.tasks = append(m.tasks, Task{Text: text})
 					m.input.Reset()
-					m.focus = focusTasks
-					m.input.Blur()
 					m.rebuildTaskViewport()
 				}
-			case "esc":
-				m.focus = focusTasks
+				m.inputActive = false
 				m.input.Blur()
-				m.rebuildTaskViewport()
+			case "esc":
+				m.inputActive = false
+				m.input.Blur()
 			default:
 				var cmd tea.Cmd
 				m.input, cmd = m.input.Update(msg)
@@ -322,7 +368,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		if m.focus == focusBriefing {
+		// Per-view keys
+		switch m.activeView {
+
+		case viewBriefing:
 			switch msg.String() {
 			case "c":
 				if m.summary != "" {
@@ -333,72 +382,67 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.briefViewport, cmd = m.briefViewport.Update(msg)
 				return m, cmd
 			}
-			return m, nil
-		}
 
-		if m.focus == focusPages {
+		case viewPages:
 			switch msg.String() {
 			case "j", "down":
 				if m.pageCursor < len(m.pages)-1 {
 					m.pageCursor++
-					if m.pageCursor > m.pagesViewport.YOffset+m.pagesViewport.Height-1 {
-						m.pagesViewport.LineDown(1)
-					}
 					m.rebuildPagesViewport()
 				}
 			case "k", "up":
 				if m.pageCursor > 0 {
 					m.pageCursor--
-					if m.pageCursor < m.pagesViewport.YOffset {
-						m.pagesViewport.LineUp(1)
-					}
 					m.rebuildPagesViewport()
 				}
 			case "enter":
 				if len(m.pages) > 0 {
 					m.summarizing = true
 					m.summary = ""
-					m.briefViewport.SetContent("Summarizing...")
-					return m, doSummarize(m.pages[m.pageCursor])
+					m.briefViewport.SetContent(m.spinner.View() + " Summarizing...")
+					m.activeView = viewBriefing
+					return m, doSummarize(m.pages[m.pageCursor], m.tasks)
 				}
 			case "r":
 				m.loading = true
 				m.fetchErr = ""
+				m.rebuildPagesViewport()
 				return m, doFetchPages
 			}
-			return m, nil
-		}
 
-		if m.focus == focusTasks {
+		case viewTasks:
 			switch msg.String() {
 			case "j", "down":
 				if m.cursor < len(m.tasks)-1 {
 					m.cursor++
-					if m.cursor > m.taskViewport.YOffset+m.taskViewport.Height-1 {
-						m.taskViewport.LineDown(1)
-					}
 					m.rebuildTaskViewport()
 				}
 			case "k", "up":
 				if m.cursor > 0 {
 					m.cursor--
-					if m.cursor < m.taskViewport.YOffset {
-						m.taskViewport.LineUp(1)
-					}
 					m.rebuildTaskViewport()
 				}
 			case " ", "enter":
 				if len(m.tasks) > 0 {
 					t := &m.tasks[m.cursor]
 					t.Done = !t.Done
-
 					if t.Done {
-						m.log = append(m.log, LogEntry{
-							Text: t.Text,
-							At:   time.Now(),
-						})
+						m.log = append(m.log, LogEntry{Text: t.Text, At: time.Now()})
+					} else {
+						for i, e := range m.log {
+							if e.Text == t.Text {
+								m.log = append(m.log[:i], m.log[i+1:]...)
+								break
+							}
+						}
 					}
 					m.rebuildTaskViewport()
+					m.rebuildDoneViewport()
+					// Re-summarize silently in background so briefing stays accurate
+					if m.summary != "" && len(m.pages) > 0 {
+						m.summarizing = true
+						return m, doSummarize(m.pages[m.pageCursor], m.tasks)
+					}
 				}
 			case "d":
 				if len(m.tasks) > 0 {
@@ -409,93 +453,102 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.rebuildTaskViewport()
 				}
 			case "n":
-				m.focus = focusInput
+				m.inputActive = true
 				m.input.Focus()
 			}
+
+		case viewDone:
+			var cmd tea.Cmd
+			m.doneViewport, cmd = m.doneViewport.Update(msg)
+			return m, cmd
 		}
 	}
 
 	return m, nil
 }
 
+// -----------------------------------------------------------------------
+// View
+// -----------------------------------------------------------------------
+
+func (m model) tabBar() string {
+	var tabs []string
+	for i, name := range viewNames {
+		label := fmt.Sprintf("%d %s", i+1, name)
+		if view(i) == m.activeView {
+			tabs = append(tabs, styleTabActive.Render(label))
+		} else {
+			tabs = append(tabs, styleTabInactive.Render(label))
+		}
+	}
+	bar := strings.Join(tabs, styleTabInactive.Render(" │ "))
+	return styleTabBar.Width(m.width-4).Render(bar)
+}
+
+func (m model) hintLine() string {
+	switch m.activeView {
+	case viewBriefing:
+		return styleHint.Render("j/k scroll  •  c copy  •  1-4/tab switch")
+	case viewPages:
+		return styleHint.Render("j/k navigate  •  enter summarize  •  r refresh  •  1-4/tab switch")
+	case viewTasks:
+		if m.inputActive {
+			return styleHint.Render("enter confirm  •  esc cancel")
+		}
+		return styleHint.Render("j/k navigate  •  space toggle  •  n add  •  d delete  •  1-4/tab switch")
+	case viewDone:
+		return styleHint.Render("j/k scroll  •  1-4/tab switch")
+	}
+	return ""
+}
+
+func (m model) activeContent() string {
+	switch m.activeView {
+	case viewBriefing:
+		if m.summarizing {
+			return m.spinner.View() + " Summarizing with Ollama..."
+		}
+		if m.loading {
+			return m.spinner.View() + " Fetching Notion..."
+		}
+		return m.briefViewport.View()
+
+	case viewPages:
+		if m.loading {
+			return m.spinner.View() + " Fetching pages..."
+		}
+		content := m.pagesViewport.View()
+		if m.fetchErr != "" {
+			content += "\n" + styleErr.Render("error: "+m.fetchErr)
+		}
+		return content
+
+	case viewTasks:
+		content := m.taskViewport.View()
+		if m.inputActive {
+			content += "\n\n" + styleCursor.Render("> ") + m.input.View()
+		}
+		return content
+
+	case viewDone:
+		return m.doneViewport.View()
+	}
+	return ""
+}
+
 func (m model) View() string {
 	if m.width == 0 {
 		return ""
 	}
-
-	w := m.width - 4
-
-	var out []string
-
-	out = append(out,
-		styleHeader.Render(
-			fmt.Sprintf("NOTION BRIEF  //  %s",
-				time.Now().Format("Monday, January 2")),
-		),
+	return lipgloss.NewStyle().Padding(1, 2).Render(
+		m.tabBar() + "\n" +
+			m.activeContent() + "\n\n" +
+			m.hintLine(),
 	)
-
-	var briefContent string
-	if m.summarizing {
-		briefContent = m.spinner.View() + " Summarizing with Ollama..."
-	} else if m.loading {
-		briefContent = m.spinner.View() + " Fetching Notion..."
-	} else {
-		briefContent = m.briefViewport.View()
-	}
-
-	briefStyle := styleBox.Width(w)
-	if m.focus == focusBriefing {
-		briefStyle = briefStyle.BorderForeground(accent)
-	}
-
-	out = append(out,
-		briefStyle.Render(
-			styleLabel.Render("BRIEFING")+"\n"+briefContent+
-				"\n"+styleHint.Render("j/k to scroll • [c] copy"),
-		),
-	)
-
-	pagesStyle := styleBox.Width(w)
-	if m.focus == focusPages {
-		pagesStyle = pagesStyle.BorderForeground(accent)
-	}
-
-	out = append(out,
-		pagesStyle.Render(
-			styleLabel.Render("NOTION PAGES")+"\n"+
-				m.pagesViewport.View()+"\n"+
-				styleHint.Render("[enter] summarize • [tab] switch • j/k navigate • r refresh"),
-		),
-	)
-
-	var logLines []string
-	for _, e := range m.log {
-		logLines = append(logLines,
-			styleLogTime.Render(e.At.Format("15:04"))+
-				" "+
-				styleLogText.Render(e.Text),
-		)
-	}
-
-	if len(logLines) == 0 {
-		logLines = append(logLines, "Completed tasks show up here.")
-	}
-
-	out = append(out,
-		styleBox.Width(w).Render(
-			styleLabel.Render("DONE TODAY")+"\n"+
-				strings.Join(logLines, "\n"),
-		),
-	)
-
-	return lipgloss.NewStyle().
-		Padding(1, 2).
-		Render(strings.Join(out, "\n"))
 }
 
 func main() {
 	p := tea.NewProgram(newModel(), tea.WithAltScreen())
-
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
