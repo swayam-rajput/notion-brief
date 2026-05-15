@@ -22,42 +22,48 @@ import (
 var (
 	accent = lipgloss.Color("#819C91")
 	muted  = lipgloss.Color("#555555")
-	done   = lipgloss.Color("#9BBFA6")
+	done   = lipgloss.Color("#5A9E6F")
 	dim    = lipgloss.Color("#D0D0D0")
 
-	styleTabActive = lipgloss.NewStyle().
-			Foreground(accent).
-			Bold(true).
-			PaddingLeft(1).
-			PaddingRight(1)
-
-	styleTabInactive = lipgloss.NewStyle().
-				Foreground(muted).
-				PaddingLeft(1).
-				PaddingRight(1)
-
-	styleTabBar = lipgloss.NewStyle().
+	styleTabActive = lipgloss.NewStyle().Foreground(accent).Bold(true).PaddingLeft(1).PaddingRight(1)
+	styleTabInactive = lipgloss.NewStyle().Foreground(muted).PaddingLeft(1).PaddingRight(1)
+	styleTabBar    = lipgloss.NewStyle().
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderBottom(true).
 			BorderForeground(muted).
 			MarginBottom(1)
 
-	styleHint     = lipgloss.NewStyle().Foreground(muted).Italic(false)
+	styleHint     = lipgloss.NewStyle().Foreground(muted)
 	styleCursor   = lipgloss.NewStyle().Foreground(accent).Bold(true)
 	styleDone     = lipgloss.NewStyle().Foreground(done).Strikethrough(true)
 	stylePending  = lipgloss.NewStyle().Foreground(dim)
-	styleBrief    = lipgloss.NewStyle().Foreground(dim).Italic(true)
-	styleErr      = lipgloss.NewStyle().Foreground(lipgloss.Color("#AA4444")).Italic(true)
+	styleBrief    = lipgloss.NewStyle().Foreground(dim)
+	styleErr      = lipgloss.NewStyle().Foreground(lipgloss.Color("#AA4444"))
 	styleLogTime  = lipgloss.NewStyle().Foreground(accent)
 	styleLogText  = lipgloss.NewStyle().Foreground(muted)
-	styleSelected = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#000000")).
-			Background(accent).
-			Bold(false).PaddingRight(1)
+	styleSelected = lipgloss.NewStyle().Foreground(lipgloss.Color("#000000")).PaddingLeft(1).PaddingRight(1).Background(accent).Bold(true)
+	styleSuccess  = lipgloss.NewStyle().Foreground(done)
+
+	stylePickerTitle = lipgloss.NewStyle().Foreground(accent).Bold(true).MarginBottom(1)
+	stylePickerItem  = lipgloss.NewStyle().Foreground(dim).PaddingLeft(2).PaddingRight(2)
+	stylePickerSel   = lipgloss.NewStyle().Foreground(lipgloss.Color("#000000")).Background(accent).Bold(true).PaddingLeft(2).PaddingRight(1)
+	stylePickerHint  = lipgloss.NewStyle().Foreground(muted).MarginTop(1)
+	stylePickerKey   = lipgloss.NewStyle().Foreground(accent).PaddingRight(1)
 )
 
 // -----------------------------------------------------------------------
-// Views
+// Screen
+// -----------------------------------------------------------------------
+
+type screen int
+
+const (
+	screenMain   screen = iota
+	screenPicker        // model picker overlay
+)
+
+// -----------------------------------------------------------------------
+// Views (main screen)
 // -----------------------------------------------------------------------
 
 type view int
@@ -85,6 +91,8 @@ type summaryMsg struct {
 	err     error
 }
 
+type savedTasksMsg struct{ err error }
+
 // -----------------------------------------------------------------------
 // Data types
 // -----------------------------------------------------------------------
@@ -107,15 +115,19 @@ type model struct {
 	width  int
 	height int
 
-	activeView view
+	activeScreen screen
+	activeView   view
 
+	// fetch / summarize state
 	loading     bool
 	summarizing bool
 	spinner     spinner.Model
 	pages       []NotionPage
 	summary     string
 	fetchErr    string
+	saveMsg     string // transient feedback after saving
 
+	// viewports
 	briefViewport viewport.Model
 	pagesViewport viewport.Model
 	taskViewport  viewport.Model
@@ -130,6 +142,13 @@ type model struct {
 	input       textinput.Model
 
 	log []LogEntry
+
+	// model picker
+	pickerCursor  int
+	pickerKeyInput textinput.Model // for entering API keys
+	pickerKeyMode  bool            // true when typing a key
+	selectedModel  AIModel
+	cfg            Config
 }
 
 func newModel() model {
@@ -140,17 +159,38 @@ func newModel() model {
 	ti := textinput.New()
 	ti.Placeholder = "New task..."
 	ti.CharLimit = 120
-	ti.Width = 50
+
+	keyInput := textinput.New()
+	keyInput.Placeholder = "Paste API key here..."
+	keyInput.CharLimit = 200
+	keyInput.EchoMode = textinput.EchoPassword
+	keyInput.EchoCharacter = '•'
+
+	// Load persisted config and tasks
+	cfg, _ := loadConfig()
+	if cfg.SelectedModel < 0 || cfg.SelectedModel >= len(AvailableModels) {
+		cfg.SelectedModel = 0
+	}
+	selectedModel := AvailableModels[cfg.SelectedModel]
+
+	tasks, log, _ := loadTasks()
 
 	return model{
-		loading:       true,
-		spinner:       sp,
-		input:         ti,
-		activeView:    viewPages,
-		briefViewport: viewport.New(80, 10),
-		pagesViewport: viewport.New(80, 10),
-		taskViewport:  viewport.New(80, 10),
-		doneViewport:  viewport.New(80, 10),
+		loading:        true,
+		spinner:        sp,
+		input:          ti,
+		pickerKeyInput: keyInput,
+		activeView:     viewPages,
+		activeScreen:   screenMain,
+		briefViewport:  viewport.New(80, 10),
+		pagesViewport:  viewport.New(80, 10),
+		taskViewport:   viewport.New(80, 10),
+		doneViewport:   viewport.New(80, 10),
+		selectedModel:  selectedModel,
+		pickerCursor:   cfg.SelectedModel,
+		cfg:            cfg,
+		tasks:          tasks,
+		log:            log,
 	}
 }
 
@@ -168,14 +208,13 @@ func doFetchPages() tea.Msg {
 	return fetchedPagesMsg{pages: pages, err: err}
 }
 
-func doSummarize(page NotionPage, tasks []Task) tea.Cmd {
+func doSummarize(page NotionPage, tasks []Task, model AIModel) tea.Cmd {
 	return func() tea.Msg {
 		content, err := fetchPageContent(page.ID)
 		if err != nil {
 			return summaryMsg{err: err}
 		}
 
-		// Give the model full task context so it knows what's done and what's pending
 		var pending, completed []string
 		for _, t := range tasks {
 			if t.Done {
@@ -192,8 +231,15 @@ func doSummarize(page NotionPage, tasks []Task) tea.Cmd {
 			taskContext += "\n\nCompleted today:\n" + strings.Join(completed, "\n")
 		}
 
-		summary, err := summarizeWithOllama(content + taskContext)
+		summary, err := summarizeWithAI(content+taskContext, model)
 		return summaryMsg{summary: summary, err: err}
+	}
+}
+
+func doSaveTasks(tasks []Task, log []LogEntry) tea.Cmd {
+	return func() tea.Msg {
+		err := saveTasks(tasks, log)
+		return savedTasksMsg{err: err}
 	}
 }
 
@@ -259,7 +305,6 @@ func (m *model) resizeViewports() {
 		contentH = 4
 	}
 	w := m.width - 4
-
 	m.briefViewport.Width = w
 	m.briefViewport.Height = contentH
 	m.pagesViewport.Width = w
@@ -269,6 +314,7 @@ func (m *model) resizeViewports() {
 	m.doneViewport.Width = w
 	m.doneViewport.Height = contentH
 	m.input.Width = w - 4
+	m.pickerKeyInput.Width = w - 10
 }
 
 // -----------------------------------------------------------------------
@@ -313,12 +359,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case savedTasksMsg:
+		if msg.err != nil {
+			m.saveMsg = styleErr.Render("save failed: " + msg.err.Error())
+		} else {
+			m.saveMsg = styleSuccess.Render("tasks saved")
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
+			// Auto-save on quit
+			return m, tea.Sequence(doSaveTasks(m.tasks, m.log), tea.Quit)
 		}
 
-		// View switching — skip if user is typing a task
+		// ---- Picker screen ----------------------------------------
+		if m.activeScreen == screenPicker {
+			return m.updatePicker(msg)
+		}
+
+		// ---- Main screen ------------------------------------------
+
+		// Open picker with m key (not while typing)
+		if msg.String() == "m" && !m.inputActive {
+			m.activeScreen = screenPicker
+			m.pickerKeyMode = false
+			m.pickerKeyInput.Reset()
+			m.pickerKeyInput.Blur()
+			return m, nil
+		}
+
+		// View switching
 		if !m.inputActive {
 			switch msg.String() {
 			case "1":
@@ -342,12 +413,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rebuildTaskViewport()
 				m.rebuildDoneViewport()
 				return m, nil
+			case "s":
+				// Manual save
+				return m, doSaveTasks(m.tasks, m.log)
 			case "q":
-				return m, tea.Quit
+				return m, tea.Sequence(doSaveTasks(m.tasks, m.log), tea.Quit)
 			}
 		}
 
-		// Task input mode
+		// Task input
 		if m.inputActive {
 			switch msg.String() {
 			case "enter":
@@ -372,7 +446,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Per-view keys
 		switch m.activeView {
-
 		case viewBriefing:
 			switch msg.String() {
 			case "c":
@@ -403,7 +476,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.summary = ""
 					m.briefViewport.SetContent(m.spinner.View() + " Summarizing...")
 					m.activeView = viewBriefing
-					return m, doSummarize(m.pages[m.pageCursor], m.tasks)
+					return m, doSummarize(m.pages[m.pageCursor], m.tasks, m.selectedModel)
 				}
 			case "r":
 				m.loading = true
@@ -440,10 +513,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.rebuildTaskViewport()
 					m.rebuildDoneViewport()
-					// Re-summarize silently in background so briefing stays accurate
 					if m.summary != "" && len(m.pages) > 0 {
 						m.summarizing = true
-						return m, doSummarize(m.pages[m.pageCursor], m.tasks)
+						return m, doSummarize(m.pages[m.pageCursor], m.tasks, m.selectedModel)
 					}
 				}
 			case "d":
@@ -470,6 +542,84 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // -----------------------------------------------------------------------
+// Picker update
+// -----------------------------------------------------------------------
+
+func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Key input mode — user is typing an API key
+	if m.pickerKeyMode {
+		switch msg.String() {
+		case "enter":
+			key := strings.TrimSpace(m.pickerKeyInput.Value())
+			switch AvailableModels[m.pickerCursor].Provider {
+			case ProviderClaude:
+				m.cfg.AnthropicKey = key
+			case ProviderOpenAI:
+				m.cfg.OpenAIKey = key
+			}
+			m.pickerKeyInput.Reset()
+			m.pickerKeyMode = false
+			m.pickerKeyInput.Blur()
+			_ = saveConfig(m.cfg)
+		case "esc":
+			m.pickerKeyMode = false
+			m.pickerKeyInput.Blur()
+		default:
+			var cmd tea.Cmd
+			m.pickerKeyInput, cmd = m.pickerKeyInput.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+	}
+
+	// Normal picker navigation
+	switch msg.String() {
+	case "esc", "m":
+		m.activeScreen = screenMain
+	case "j", "down":
+		if m.pickerCursor < len(AvailableModels)-1 {
+			m.pickerCursor++
+		}
+	case "k", "up":
+		if m.pickerCursor > 0 {
+			m.pickerCursor--
+		}
+	case "enter":
+		chosen := AvailableModels[m.pickerCursor]
+		// If provider needs a key and we don't have one, prompt for it
+		needsKey := chosen.NeedsKey
+		hasKey := false
+		switch chosen.Provider {
+		case ProviderClaude:
+			hasKey = m.cfg.AnthropicKey != ""
+		case ProviderOpenAI:
+			hasKey = m.cfg.OpenAIKey != ""
+		}
+		if needsKey && !hasKey {
+			m.pickerKeyMode = true
+			m.pickerKeyInput.Focus()
+			return m, nil
+		}
+		// Confirm selection
+		m.selectedModel = chosen
+		m.cfg.SelectedModel = m.pickerCursor
+		_ = saveConfig(m.cfg)
+		m.activeScreen = screenMain
+		m.saveMsg = styleSuccess.Render("model set to " + chosen.Name)
+	case "x":
+		// Clear stored key for current selection
+		switch AvailableModels[m.pickerCursor].Provider {
+		case ProviderClaude:
+			m.cfg.AnthropicKey = ""
+		case ProviderOpenAI:
+			m.cfg.OpenAIKey = ""
+		}
+		_ = saveConfig(m.cfg)
+	}
+	return m, nil
+}
+
+// -----------------------------------------------------------------------
 // View
 // -----------------------------------------------------------------------
 
@@ -488,18 +638,27 @@ func (m model) tabBar() string {
 }
 
 func (m model) hintLine() string {
+	modelTag := stylePickerKey.Render("[" + m.selectedModel.Name + "]")
+	saveFeedback := ""
+	if m.saveMsg != "" {
+		saveFeedback = "  " + m.saveMsg
+	}
+
 	switch m.activeView {
 	case viewBriefing:
-		return styleHint.Render("j/k scroll  •  c copy  •  1-4/tab switch  •  [q] quit")
+		return styleHint.Render("[j/k] scroll  •  [c] copy  •  1-4/tab switch  •  [m] model  •  [q] quit")+
+			"  "+modelTag+saveFeedback
 	case viewPages:
-		return styleHint.Render("j/k navigate  •  enter summarize  •  r refresh  •  1-4/tab switch  •  [q] quit")
+		return styleHint.Render("[j/k] navigate  •  [enter] summarize  •  [r] refresh  •  [m] model  •  [q] quit")+
+			"  "+modelTag+saveFeedback
 	case viewTasks:
 		if m.inputActive {
 			return styleHint.Render("enter confirm  •  esc cancel")
 		}
-		return styleHint.Render("j/k navigate  •  space toggle  •  n add  •  d delete  •  1-4/tab switch  •  [q] quit")
+		return styleHint.Render("[j/k] navigate  •  [space] toggle  •  [n] add  •  [d] delete  •  [s] save  •  [m] model  •  [q] quit")+
+			"  "+modelTag+saveFeedback
 	case viewDone:
-		return styleHint.Render("j/k scroll  •  1-4/tab switch  •  [q] quit")
+		return styleHint.Render("[j/k] scroll  •  [s] save  •  [m] model  •  [q] quit")+"  "+modelTag+saveFeedback
 	}
 	return ""
 }
@@ -508,7 +667,7 @@ func (m model) activeContent() string {
 	switch m.activeView {
 	case viewBriefing:
 		if m.summarizing {
-			return m.spinner.View() + " Summarizing with Ollama..."
+			return m.spinner.View() + " Summarizing with " + m.selectedModel.Name + "..."
 		}
 		if m.loading {
 			return m.spinner.View() + " Fetching Notion..."
@@ -528,7 +687,7 @@ func (m model) activeContent() string {
 	case viewTasks:
 		content := m.taskViewport.View()
 		if m.inputActive {
-			content += "\n\n"  + m.input.View()
+			content += "\n\n" + m.input.View()
 		}
 		return content
 
@@ -538,16 +697,66 @@ func (m model) activeContent() string {
 	return ""
 }
 
+func (m model) pickerView() string {
+	var lines []string
+
+	lines = append(lines, stylePickerTitle.Render("Select AI Model"))
+
+	for i, am := range AvailableModels {
+		label := am.Name
+		// Show key status for providers that need one
+		if am.NeedsKey {
+			hasKey := false
+			switch am.Provider {
+			case ProviderClaude:
+				hasKey = m.cfg.AnthropicKey != ""
+			case ProviderOpenAI:
+				hasKey = m.cfg.OpenAIKey != ""
+			}
+			if hasKey {
+				label += styleSuccess.Render(" ✓ key set")
+			} else {
+				label += styleErr.Render(" no key")
+			}
+		}
+		if i == m.pickerCursor {
+			lines = append(lines, styleCursor.Render("> ")+stylePickerSel.Render(label))
+		} else {
+			lines = append(lines, stylePickerItem.Render(label))
+		}
+	}
+
+	if m.pickerKeyMode {
+		lines = append(lines, "")
+		lines = append(lines, styleCursor.Render("> ")+m.pickerKeyInput.View())
+		lines = append(lines, stylePickerHint.Render("paste key and press enter  •  esc cancel"))
+	} else {
+		lines = append(lines, "")
+		lines = append(lines, stylePickerHint.Render("enter select  •  x clear key  •  esc close  •  j/k navigate"))
+	}
+
+	return lipgloss.NewStyle().Padding(1, 2).Render(strings.Join(lines, "\n"))
+}
+
 func (m model) View() string {
 	if m.width == 0 {
 		return ""
 	}
+
+	if m.activeScreen == screenPicker {
+		return m.pickerView()
+	}
+
 	return lipgloss.NewStyle().Padding(1, 2).Render(
 		m.tabBar() + "\n" +
 			m.activeContent() + "\n\n" +
 			m.hintLine(),
 	)
 }
+
+// -----------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------
 
 func main() {
 	p := tea.NewProgram(newModel(), tea.WithAltScreen())
