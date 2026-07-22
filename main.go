@@ -20,7 +20,7 @@ import (
 // -----------------------------------------------------------------------
 
 var (
-	accent = lipgloss.Color("#819C91")
+	accent = lipgloss.Color("#fefefe")
 	muted  = lipgloss.Color("#555555")
 	done   = lipgloss.Color("#5A9E6F")
 	dim    = lipgloss.Color("#D0D0D0")
@@ -317,6 +317,15 @@ func (m *model) resizeViewports() {
 	m.pickerKeyInput.Width = w - 10
 }
 
+func (m *model) scrollNotesIntoView() {
+	lineH := 1
+	cursorY := m.pageCursor * lineH
+	if cursorY < m.pagesViewport.YOffset {
+		m.pagesViewport.SetYOffset(cursorY)
+	} else if cursorY >= m.pagesViewport.YOffset+m.pagesViewport.Height {
+		m.pagesViewport.SetYOffset(cursorY - m.pagesViewport.Height + 1)
+	}
+}
 // -----------------------------------------------------------------------
 // Update
 // -----------------------------------------------------------------------
@@ -464,11 +473,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.pageCursor < len(m.pages)-1 {
 					m.pageCursor++
 					m.rebuildPagesViewport()
+					m.scrollNotesIntoView()
 				}
 			case "k", "up":
 				if m.pageCursor > 0 {
 					m.pageCursor--
 					m.rebuildPagesViewport()
+					m.scrollNotesIntoView()
 				}
 			case "enter":
 				if len(m.pages) > 0 {
